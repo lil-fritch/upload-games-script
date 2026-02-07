@@ -14,14 +14,25 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
+class LLMServerFailure(Exception):
+    """Custom exception raised when LLM server has too many consecutive errors."""
+    pass
+
 class AsyncLLMClient:
     def __init__(self, api_url=None, api_key=None, model=None):
         self.api_url = api_url or os.getenv("LLM_API_URL", "http://localhost:11434")
         self.api_key = api_key or os.getenv("LLM_API_KEY", "")
         self.model = model or os.getenv("LLM_MODEL_FAST", "llama3.2:latest")
         self.delay = float(os.getenv("LLM_DELAY", "1.0"))
+        
+        self.consecutive_errors = 0
+        self.max_consecutive_errors = int(os.getenv("LLM_MAX_ERRORS", "10"))
 
     async def generate(self, prompt: str, temperature: float = 0.7) -> str:
+        # Circuit breaker check
+        if self.consecutive_errors >= self.max_consecutive_errors:
+            raise LLMServerFailure(f"Stopped after {self.consecutive_errors} consecutive LLM errors.")
+
         # Add delay
         if self.delay > 0:
             await asyncio.sleep(self.delay)
@@ -61,8 +72,15 @@ class AsyncLLMClient:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(endpoint, json=payload, headers=headers) as response:
                     if response.status != 200:
+                        self.consecutive_errors += 1
                         logger.error(f"LLM Error {response.status}: {await response.text()}")
+                        
+                        if self.consecutive_errors >= self.max_consecutive_errors:
+                            raise LLMServerFailure(f"Too many consecutive errors ({self.consecutive_errors})")
                         return None
+                    
+                    # Reset error count on success
+                    self.consecutive_errors = 0
                     
                     data = await response.json()
                     
@@ -72,7 +90,15 @@ class AsyncLLMClient:
                         result = data.get("response", "")
                     
                     return result
+
+        except LLMServerFailure:
+            # Re-raise explicit server failure
+            raise
         except Exception as e:
+            self.consecutive_errors += 1
+            if self.consecutive_errors >= self.max_consecutive_errors:
+                raise LLMServerFailure(f"Too many consecutive errors ({self.consecutive_errors}) - Last error: {e}")
+            
             logger.error(f"Async LLM Generation failed: {e}")
             return None
 
@@ -162,6 +188,8 @@ async def generate_description_async(client: AsyncLLMClient, game: Dict[str, Any
              fallback += "."
              return fallback
         return description.strip().replace('"', '')
+    except LLMServerFailure:
+        raise
     except Exception as e:
         logger.error(f"LLM Error for {name}: {e}")
         return f"Play {name} by {provider}."
@@ -300,8 +328,19 @@ async def main_async_full(limit=0):
             task = asyncio.create_task(tracked_process(game))
             tasks.append(task)
         
-        # Gather results
-        results = await asyncio.gather(*tasks)
+        # Gather results with circuit breaker support
+        try:
+            results = await asyncio.gather(*tasks)
+        except LLMServerFailure as e:
+            pbar.close()
+            logger.critical(f"\n\n!!! ABORTED MIGRATION !!!")
+            logger.critical(f"Reason: {e}")
+            logger.critical("Cancelling pending tasks...")
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            return
+
         pbar.close()
             
     success = results.count("success")
