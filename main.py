@@ -114,22 +114,54 @@ CONCURRENCY_LIMIT = 12
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def load_processed_slugs() -> set:
-    if not os.path.exists(STATE_FILE):
-        return set()
-    try:
-        with open(STATE_FILE, 'r') as f:
-            return set(line.strip() for line in f if line.strip())
-    except Exception as e:
-        logger.error(f"Error loading state file: {e}")
-        return set()
 
-def mark_as_processed(slug: str):
-    try:
-        with open(STATE_FILE, 'a') as f:
-            f.write(f"{slug}\n")
-    except Exception as e:
-        logger.error(f"Error saving state: {e}")
+async def fetch_all_existing_slugs(session: aiohttp.ClientSession) -> set:
+    """Fetch all existing game slugs from Strapi with pagination."""
+    logger.info("Fetching existing games from Strapi...")
+    slugs = set()
+    page = 1
+    page_size = 100
+    headers = {"Authorization": f"Bearer {STRAPI_API_TOKEN}"}
+    
+    while True:
+        try:
+            url = f"{STRAPI_API_URL}?fields[0]=slug&pagination[page]={page}&pagination[pageSize]={page_size}"
+            async with session.get(url, headers=headers) as response:
+                if response.status != 200:
+                    logger.error(f"Error fetching existing games page {page}: {response.status}")
+                    break
+                
+                data = await response.json()
+                items = data.get('data', [])
+                
+                if not items:
+                    break
+                
+                for item in items:
+                    # Handle both flattened and standard structure
+                    attributes = item.get('attributes', item)
+                    slug = attributes.get('slug')
+                    if slug:
+                        slugs.add(slug)
+                
+                # Check pagination meta to see if we reached the end
+                meta = data.get('meta', {})
+                pagination = meta.get('pagination', {})
+                page_count = pagination.get('pageCount', 0)
+                
+                if page >= page_count and page_count > 0:
+                    break
+                if len(items) < page_size: # Fallback check 
+                    break
+                    
+                page += 1
+                
+        except Exception as e:
+            logger.error(f"Exception fetching existing games: {e}")
+            break
+            
+    logger.info(f"Found {len(slugs)} existing games in Strapi.")
+    return slugs
 
 def fetch_games_from_db() -> List[Dict[str, Any]]:
     try:
@@ -282,7 +314,6 @@ async def process_one_game(semaphore, session, client, game):
         if status == "success" or status == "skipped":
             if status == "success": logger.info(f"SUCCESS: {name}")
             else: logger.info(f"SKIPPED (API): {name} (already exists)")
-            mark_as_processed(slug)
         
         return status
 
@@ -296,22 +327,22 @@ async def main_async_full(limit=0):
         return
 
     games = fetch_games_from_db()
-    processed_slugs = load_processed_slugs()
-    games_to_process = [g for g in games if g.get('slug') not in processed_slugs]
-    
-    if limit > 0:
-        games_to_process = games_to_process[:limit]
-        
-    logger.info(f"Processing {len(games_to_process)} games with concurrency {CONCURRENCY_LIMIT}")
-
-    # Async Loop
-    semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
-    
     start_time = time.time()
-    total_games = len(games_to_process)
-    completed_count = 0
     
     async with aiohttp.ClientSession() as session:
+        # Pre-fetch existing slugs from Strapi
+        processed_slugs = await fetch_all_existing_slugs(session)
+        games_to_process = [g for g in games if g.get('slug') not in processed_slugs]
+
+        if limit > 0:
+            games_to_process = games_to_process[:limit]
+
+        logger.info(f"Processing {len(games_to_process)} games with concurrency {CONCURRENCY_LIMIT}")
+        
+        semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
+        
+        total_games = len(games_to_process)
+        completed_count = 0
         tasks = []
         
         # ProgressBar
