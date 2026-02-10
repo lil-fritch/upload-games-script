@@ -125,7 +125,9 @@ async def fetch_all_existing_slugs(session: aiohttp.ClientSession) -> set:
     
     while True:
         try:
-            url = f"{STRAPI_API_URL}?fields[0]=slug&pagination[page]={page}&pagination[pageSize]={page_size}"
+            # Added publicationState=preview to fetch drafts as well
+            # Added sort=id:asc to ensure consistent pagination ordering
+            url = f"{STRAPI_API_URL}?fields[0]=slug&pagination[page]={page}&pagination[pageSize]={page_size}&publicationState=preview&sort=id:asc"
             async with session.get(url, headers=headers) as response:
                 if response.status != 200:
                     logger.error(f"Error fetching existing games page {page}: {response.status}")
@@ -134,6 +136,12 @@ async def fetch_all_existing_slugs(session: aiohttp.ClientSession) -> set:
                 data = await response.json()
                 items = data.get('data', [])
                 
+                # Log total count on first page for verification
+                if page == 1:
+                    meta = data.get('meta', {})
+                    total = meta.get('pagination', {}).get('total', 'unknown')
+                    logger.info(f"Strapi reports total items (including drafts): {total}")
+
                 if not items:
                     break
                 
